@@ -1,6 +1,6 @@
-import type { BufferAttribute, Group, InterleavedBufferAttribute, Matrix4, Mesh, MeshPhongMaterial, Object3D } from 'three'
+import type { BufferAttribute, Group, InterleavedBufferAttribute, Mesh, MeshPhongMaterial, Object3D } from 'three'
 import JSZip from 'jszip'
-import { Color, Vector3 } from 'three'
+import { Color, Matrix4, Vector3 } from 'three'
 import { computeFlushVolumesMatrix } from './flush-volumes'
 
 export { computeFlushVolumesMatrix, type FlushVolumeOptions } from './flush-volumes'
@@ -242,6 +242,10 @@ export async function exportTo3MF(
     }
   })
 
+  // 方向归一化：镜像变换（负行列式）会翻转网格绕向，必须烘焙进顶点 / Orientation normalization:
+  // mirrored transforms (negative determinant) invert triangle winding, so bake them into vertices
+  bakeNegativeDeterminantTransforms(components, buildItems)
+
   // 居中逻辑 / Centering Logic
   const { min, max } = bounds.result()
 
@@ -268,6 +272,102 @@ export async function exportTo3MF(
 
   // 生成ZIP文件 / Generate ZIP file
   return await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml', compression })
+}
+
+/**
+ * 3MF consumers rely on triangle winding (counter-clockwise seen from outside) to tell
+ * the outside of a mesh. A mirrored transform (negative determinant, e.g. a
+ * `scale(s, -s, 1)` Y-flip used to map SVG's y-down coordinates) inverts the winding of
+ * every referenced mesh, producing inside-out solids in slicers.
+ * A mirror cannot be cancelled by reordering triangles alone, so any build item whose
+ * accumulated transform chain has a negative determinant is rewritten here: the chain is
+ * baked into new mesh components (reversing triangle winding where the determinant is
+ * negative) and the item is re-referenced with an identity transform.
+ * Items without mirrors are left untouched, so their XML output is unchanged.
+ */
+function bakeNegativeDeterminantTransforms(components: ComponentInfo[], buildItems: BuildItem[]): void {
+  const byId = new Map(components.map(c => [c.id, c]))
+  const itemMatrix = new Matrix4()
+  const vertex = new Vector3()
+
+  for (const item of buildItems) {
+    const root = byId.get(item.objectId)
+    if (!root)
+      continue
+
+    // Accumulate the transform chain down to each mesh leaf (item transform included)
+    const leaves: { component: ComponentInfo, matrix: Matrix4 }[] = []
+    const collect = (c: ComponentInfo, matrix: Matrix4) => {
+      if (c.type === 'mesh') {
+        leaves.push({ component: c, matrix })
+        return
+      }
+      for (const sub of c.subComponents) {
+        const child = byId.get(sub.objectId)
+        if (child)
+          collect(child, matrix.clone().multiply(sub.transform))
+      }
+    }
+    collect(root, itemMatrix.fromArray(item.transformMatrix.elements).clone())
+
+    if (!leaves.some(leaf => leaf.matrix.determinant() < 0))
+      continue
+
+    // Bake every leaf of this item so the rewritten item can use an identity transform
+    const bakedIds: number[] = []
+    for (const { component, matrix } of leaves) {
+      const positions = new Float64Array(component.positions.length)
+      for (let i = 0; i < positions.length; i += 3) {
+        vertex.set(component.positions[i], component.positions[i + 1], component.positions[i + 2]).applyMatrix4(matrix)
+        positions[i] = vertex.x
+        positions[i + 1] = vertex.y
+        positions[i + 2] = vertex.z
+      }
+      let indices = component.indices
+      if (matrix.determinant() < 0) {
+        // Mirrored placement: reverse winding so triangles stay counter-clockwise from outside
+        indices = indices.slice()
+        for (let i = 0; i < indices.length; i += 3) {
+          const tmp = indices[i + 1]
+          indices[i + 1] = indices[i + 2]
+          indices[i + 2] = tmp
+        }
+      }
+      const id = components.length + 1
+      const baked: ComponentInfo = {
+        id,
+        type: 'mesh',
+        positions,
+        indices,
+        material: component.material,
+        name: component.name,
+        subComponents: [],
+        uuid: generateUUID(),
+      }
+      components.push(baked)
+      byId.set(id, baked)
+      bakedIds.push(id)
+    }
+
+    if (bakedIds.length === 1) {
+      item.objectId = bakedIds[0]
+    }
+    else {
+      const assemblyId = components.length + 1
+      components.push({
+        id: assemblyId,
+        type: 'assembly',
+        positions: new Float64Array(0),
+        indices: new Uint32Array(0),
+        material: null,
+        name: root.name,
+        subComponents: bakedIds.map(objectId => ({ objectId, transform: new Matrix4() })),
+        uuid: generateUUID(),
+      })
+      item.objectId = assemblyId
+    }
+    item.transformMatrix = new Matrix4()
+  }
 }
 
 /**
